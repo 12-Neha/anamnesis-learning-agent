@@ -27,7 +27,6 @@ async def tg_send(chat_id: str, text: str):
     async with httpx.AsyncClient(timeout=15) as client:
         await client.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": text})
 
-# --- NEW: Helper to send buttons (Part A) ---
 async def tg_send_buttons(chat_id: str, text: str, buttons: list[list[dict]]):
     if not TELEGRAM_BOT_TOKEN:
         return
@@ -39,7 +38,6 @@ async def tg_send_buttons(chat_id: str, text: str, buttons: list[list[dict]]):
     async with httpx.AsyncClient(timeout=15) as client:
         await client.post(f"{TELEGRAM_API}/sendMessage", json=payload)
 
-# --- NEW: Menu definition (Part B) ---
 def main_menu_buttons():
     return [
         [{"text": "📝 Record study", "callback_data": "menu_record"},
@@ -67,17 +65,45 @@ async def telegram_webhook(req: Request):
     except Exception:
         return {"ok": True}
 
-    msg = update.get("message") or update.get("edited_message")
-    
-    # Handle Callback Queries (Button Clicks)
-    if "callback_query" in update:
-        cb = update["callback_query"]
-        chat_id = str(cb["message"]["chat"]["id"])
-        data = cb.get("data")
-        # For now, we just acknowledge the click
-        await tg_send(chat_id, f"You selected: {data}")
+    cb = update.get("callback_query")
+    if cb:
+        chat_id = str((cb.get("message") or {}).get("chat", {}).get("id", ""))
+        user = cb.get("from") or {}
+        user_id = str(user.get("id", ""))
+        data = cb.get("data", "")
+
+        if not chat_id or not allowed(user_id):
+            return {"ok": True}
+
+        if data == "menu_recent":
+            items = get_recent_study(chat_id, n=5)
+            out = "No study items yet. Try: I studied EOQ" if not items else \
+                  "📌 Recent study:\n" + "\n".join([f"{i+1}) {it['topic']} ({it['ts']})" for i, it in enumerate(items)])
+            await tg_send(chat_id, out)
+        elif data == "menu_recollect":
+            item = get_random_study(chat_id)
+            out = 'No study items yet. Try: "I studied EOQ"' if not item else f"🧠 Recollect:\n{item['topic']}\n({item['ts']})"
+            await tg_send(chat_id, out)
+        elif data == "menu_add_resource":
+            set_mode(chat_id, "awaiting_resource")
+            await tg_send(chat_id, "🎒 Paste a link to save (or type cancel).")
+        elif data == "menu_record":
+            set_mode(chat_id, "awaiting_study")
+            await tg_send(chat_id, '📝 Send: "I studied ..." or just type the topic.')
+        elif data == "menu_cancel":
+            set_mode(chat_id, "")
+            await tg_send(chat_id, "✅ Cancelled.")
+        elif data == "menu_quiz":
+            set_mode(chat_id, "awaiting_quiz_topic")
+            await tg_send(chat_id, "❓ What topic should I quiz you on? (or type: quiz recent)")
+        elif data == "menu_news":
+            await tg_send(chat_id, "🗞 News agent coming next.")
+
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(f"{TELEGRAM_API}/answerCallbackQuery", json={"callback_query_id": cb.get("id")})
         return {"ok": True}
 
+    msg = update.get("message") or update.get("edited_message")
     if not msg:
         return {"ok": True}
 
@@ -90,7 +116,6 @@ async def telegram_webhook(req: Request):
     if not chat_id or not allowed(user_id):
         return {"ok": True}
 
-    # --- UPDATED: Help shows buttons (Part C) ---
     if is_help(text):
         await tg_send_buttons(chat_id, "Choose an action:", main_menu_buttons())
         return {"ok": True}
@@ -100,6 +125,27 @@ async def telegram_webhook(req: Request):
         await tg_send(chat_id, "✅ Cancelled.")
         return {"ok": True}
 
+    # --- Mode-based Handling (including Workflow A) ---
+    mode = get_mode(chat_id)
+    
+    if mode == "awaiting_study" and text:
+        topic = extract_study_topic(text) or text
+        append_study(chat_id, user_id, username, topic, text)
+        set_mode(chat_id, "")
+        await tg_send_buttons(chat_id, f'✅ Saved: "{topic}"', main_menu_buttons())
+        return {"ok": True}
+
+    if mode == "awaiting_resource":
+        url = extract_url(text)
+        if not url:
+            await tg_send(chat_id, "Paste a URL (or type cancel).")
+            return {"ok": True}
+        append_resource_link(chat_id, user_id, title="Saved link", url=url, raw_text=text)
+        set_mode(chat_id, "")
+        await tg_send(chat_id, f"🔖 Saved to Learning Bag:\n{url}")
+        return {"ok": True}
+
+    # Text commands fallback
     if is_recent(text):
         items = get_recent_study(chat_id, n=5)
         if not items:
@@ -115,22 +161,6 @@ async def telegram_webhook(req: Request):
             await tg_send(chat_id, 'No study items yet. Try: "I studied EOQ"')
             return {"ok": True}
         await tg_send(chat_id, f"🧠 Recollect:\n{item['topic']}\n({item['ts']})")
-        return {"ok": True}
-
-    if is_add_resource(text):
-        set_mode(chat_id, "awaiting_resource")
-        await tg_send(chat_id, "🎒 Send a link to save (or type cancel).")
-        return {"ok": True}
-
-    mode = get_mode(chat_id)
-    if mode == "awaiting_resource":
-        url = extract_url(text)
-        if not url:
-            await tg_send(chat_id, "Paste a URL (or type cancel).")
-            return {"ok": True}
-        append_resource_link(chat_id, user_id, title="Saved link", url=url, raw_text=text)
-        set_mode(chat_id, "")
-        await tg_send(chat_id, f"🔖 Saved to Learning Bag:\n{url}")
         return {"ok": True}
 
     topic = extract_study_topic(text)
