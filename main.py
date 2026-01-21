@@ -17,7 +17,7 @@ app = FastAPI()
 init_db()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-ALLOWED_USER_ID = os.getenv("ALLOWED_USER_ID", "").strip()  # optional
+ALLOWED_USER_ID = os.getenv("ALLOWED_USER_ID", "").strip()
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
@@ -26,6 +26,30 @@ async def tg_send(chat_id: str, text: str):
         return
     async with httpx.AsyncClient(timeout=15) as client:
         await client.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": text})
+
+# --- NEW: Helper to send buttons (Part A) ---
+async def tg_send_buttons(chat_id: str, text: str, buttons: list[list[dict]]):
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "reply_markup": {"inline_keyboard": buttons},
+    }
+    async with httpx.AsyncClient(timeout=15) as client:
+        await client.post(f"{TELEGRAM_API}/sendMessage", json=payload)
+
+# --- NEW: Menu definition (Part B) ---
+def main_menu_buttons():
+    return [
+        [{"text": "📝 Record study", "callback_data": "menu_record"},
+         {"text": "📌 Recent", "callback_data": "menu_recent"}],
+        [{"text": "🧠 Recollect", "callback_data": "menu_recollect"},
+         {"text": "🎒 Add resource", "callback_data": "menu_add_resource"}],
+        [{"text": "❓ Quiz me", "callback_data": "menu_quiz"},
+         {"text": "🗞 News", "callback_data": "menu_news"}],
+        [{"text": "❌ Cancel", "callback_data": "menu_cancel"}],
+    ]
 
 def allowed(user_id: str) -> bool:
     if not ALLOWED_USER_ID:
@@ -38,13 +62,22 @@ async def health():
 
 @app.post("/telegram/webhook")
 async def telegram_webhook(req: Request):
-    # Always return 200 quickly to avoid Telegram retries
     try:
         update = await req.json()
     except Exception:
         return {"ok": True}
 
     msg = update.get("message") or update.get("edited_message")
+    
+    # Handle Callback Queries (Button Clicks)
+    if "callback_query" in update:
+        cb = update["callback_query"]
+        chat_id = str(cb["message"]["chat"]["id"])
+        data = cb.get("data")
+        # For now, we just acknowledge the click
+        await tg_send(chat_id, f"You selected: {data}")
+        return {"ok": True}
+
     if not msg:
         return {"ok": True}
 
@@ -54,25 +87,19 @@ async def telegram_webhook(req: Request):
     username = user.get("username", "") or ""
     text = norm(msg.get("text", ""))
 
-    if not chat_id:
+    if not chat_id or not allowed(user_id):
         return {"ok": True}
 
-    if not allowed(user_id):
-        # silently ignore others for safety
-        return {"ok": True}
-
-    # 1) help
+    # --- UPDATED: Help shows buttons (Part C) ---
     if is_help(text):
-        await tg_send(chat_id, HELP_TEXT)
+        await tg_send_buttons(chat_id, "Choose an action:", main_menu_buttons())
         return {"ok": True}
 
-    # 2) cancel mode
     if is_cancel(text):
         set_mode(chat_id, "")
         await tg_send(chat_id, "✅ Cancelled.")
         return {"ok": True}
 
-    # 3) recent
     if is_recent(text):
         items = get_recent_study(chat_id, n=5)
         if not items:
@@ -82,7 +109,6 @@ async def telegram_webhook(req: Request):
         await tg_send(chat_id, "📌 Recent study:\n" + "\n".join(lines))
         return {"ok": True}
 
-    # 4) recollect random
     if is_recollect(text):
         item = get_random_study(chat_id)
         if not item:
@@ -91,13 +117,11 @@ async def telegram_webhook(req: Request):
         await tg_send(chat_id, f"🧠 Recollect:\n{item['topic']}\n({item['ts']})")
         return {"ok": True}
 
-    # 5) add resource mode
     if is_add_resource(text):
         set_mode(chat_id, "awaiting_resource")
         await tg_send(chat_id, "🎒 Send a link to save (or type cancel).")
         return {"ok": True}
 
-    # 6) if awaiting resource, save link
     mode = get_mode(chat_id)
     if mode == "awaiting_resource":
         url = extract_url(text)
@@ -109,13 +133,11 @@ async def telegram_webhook(req: Request):
         await tg_send(chat_id, f"🔖 Saved to Learning Bag:\n{url}")
         return {"ok": True}
 
-    # 7) study ingestion
     topic = extract_study_topic(text)
     if topic:
         append_study(chat_id, user_id, username, topic, text)
         await tg_send(chat_id, f'✅ Saved. You studied: "{topic}"')
         return {"ok": True}
 
-    # fallback
     await tg_send(chat_id, 'Got it. Type "help" for commands.')
     return {"ok": True}
