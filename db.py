@@ -52,6 +52,17 @@ def init_db():
         );
         """)
 
+        # ✅ Small KV store for agent workflows (quiz questions/answers, etc.)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS state_kv (
+            chat_id TEXT NOT NULL,
+            k TEXT NOT NULL,
+            v TEXT,
+            updated_at TEXT,
+            PRIMARY KEY (chat_id, k)
+        );
+        """)
+
 def append_study(chat_id: str, user_id: str, username: str, topic: str, raw_text: str):
     with get_conn() as conn:
         conn.execute(
@@ -66,6 +77,14 @@ def get_recent_study(chat_id: str, n: int = 5):
             (str(chat_id), n),
         ).fetchall()
     return [dict(r) for r in rows]
+
+def get_most_recent_topic(chat_id: str):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT topic FROM study_log WHERE chat_id=? ORDER BY id DESC LIMIT 1",
+            (str(chat_id),),
+        ).fetchone()
+    return (row["topic"] if row else None)
 
 def get_random_study(chat_id: str):
     with get_conn() as conn:
@@ -93,4 +112,28 @@ def append_resource_link(chat_id: str, user_id: str, title: str, url: str, raw_t
         conn.execute(
             "INSERT INTO resources (ts, chat_id, user_id, type, title, url, notes, raw_text) VALUES (?,?,?,?,?,?,?,?)",
             (now_iso(), str(chat_id), str(user_id or ""), "link", title, url, "", raw_text),
+        )
+
+# -------- KV helpers (for agent state) --------
+def kv_set(chat_id: str, k: str, v: str):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO state_kv (chat_id, k, v, updated_at) VALUES (?,?,?,?) "
+            "ON CONFLICT(chat_id, k) DO UPDATE SET v=excluded.v, updated_at=excluded.updated_at",
+            (str(chat_id), k, v, now_iso()),
+        )
+
+def kv_get(chat_id: str, k: str):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT v FROM state_kv WHERE chat_id=? AND k=?",
+            (str(chat_id), k),
+        ).fetchone()
+    return row["v"] if row else None
+
+def kv_del(chat_id: str, k: str):
+    with get_conn() as conn:
+        conn.execute(
+            "DELETE FROM state_kv WHERE chat_id=? AND k=?",
+            (str(chat_id), k),
         )
