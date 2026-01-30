@@ -5,12 +5,14 @@ from fastapi import FastAPI, Request
 from dotenv import load_dotenv
 
 from db import (
-    init_db, append_study, get_recent_study, get_most_recent_topic, get_random_study,
+    init_db, append_study, enqueue_review,
+    get_recent_study, get_most_recent_topic, get_random_study,
     set_mode, get_mode, append_resource_link,
-    kv_set, kv_get, kv_del
+    kv_set, kv_get, kv_del,
+    get_due_item, get_next_item_anytime, update_review_result
 )
 from agent import (
-    norm, is_help, is_recent, is_recollect, is_add_resource, is_cancel,
+    norm, is_help, is_recent, is_recollect, is_cancel,
     extract_study_topic, extract_url, HELP_TEXT
 )
 
@@ -20,6 +22,7 @@ init_db()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 ALLOWED_USER_ID = os.getenv("ALLOWED_USER_ID", "").strip()
+CRON_SECRET = os.getenv("CRON_SECRET", "").strip()  # optional (for GitHub Actions)
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
@@ -28,20 +31,13 @@ async def tg_send(chat_id: str, text: str):
     if not TELEGRAM_BOT_TOKEN:
         return
     async with httpx.AsyncClient(timeout=15) as client:
-        await client.post(
-            f"{TELEGRAM_API}/sendMessage",
-            json={"chat_id": chat_id, "text": text},
-        )
+        await client.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": text})
 
 
 async def tg_send_buttons(chat_id: str, text: str, buttons: list[list[dict]]):
     if not TELEGRAM_BOT_TOKEN:
         return
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "reply_markup": {"inline_keyboard": buttons},
-    }
+    payload = {"chat_id": chat_id, "text": text, "reply_markup": {"inline_keyboard": buttons}}
     async with httpx.AsyncClient(timeout=15) as client:
         await client.post(f"{TELEGRAM_API}/sendMessage", json=payload)
 
@@ -51,10 +47,19 @@ def main_menu_buttons():
         [{"text": "📝 Record study", "callback_data": "menu_record"},
          {"text": "📌 Recent", "callback_data": "menu_recent"}],
         [{"text": "🧠 Recollect", "callback_data": "menu_recollect"},
-         {"text": "🎒 Add resource", "callback_data": "menu_add_resource"}],
-        [{"text": "❓ Quiz me", "callback_data": "menu_quiz"},
-         {"text": "🗞 News", "callback_data": "menu_news"}],
-        [{"text": "❌ Cancel", "callback_data": "menu_cancel"}],
+         {"text": "🔁 Nudge me", "callback_data": "menu_nudge"}],
+        [{"text": "🎒 Add resource", "callback_data": "menu_add_resource"},
+         {"text": "❓ Quiz me", "callback_data": "menu_quiz"}],
+        [{"text": "🗞 News", "callback_data": "menu_news"},
+         {"text": "❌ Cancel", "callback_data": "menu_cancel"}],
+    ]
+
+
+def recall_buttons(review_id: int):
+    return [
+        [{"text": "✅ I remembered", "callback_data": f"sr_yes:{review_id}"},
+         {"text": "❌ I forgot", "callback_data": f"sr_no:{review_id}"}],
+        [{"text": "🏠 Menu", "callback_data": "menu_home"}],
     ]
 
 
@@ -72,8 +77,35 @@ def build_quiz_questions(topic: str):
     ]
 
 
+async def send_recall_prompt(chat_id: str, item: dict):
+    review_id = item["id"]
+    topic = item["topic"]
+    msg = f"🧠 Recall prompt:\nYou studied **{topic}**.\n\nTry to explain it in 2–3 lines (in your head), then tap:"
+    await tg_send_buttons(chat_id, msg, recall_buttons(review_id))
+
+
 @app.get("/")
 async def health():
+    return {"ok": True}
+
+
+# Optional daily trigger endpoint (for GitHub Actions later)
+@app.post("/cron/daily")
+async def cron_daily(req: Request):
+    if CRON_SECRET:
+        provided = req.headers.get("x-cron-secret", "")
+        if provided != CRON_SECRET:
+            return {"ok": False}
+
+    # For personal use: nudge the most recent chat that used the bot
+    # We store last_chat_id in kv whenever we handle a message/callback.
+    last_chat = kv_get("global", "last_chat_id")
+    if not last_chat:
+        return {"ok": True}
+
+    item = get_due_item(last_chat) or get_next_item_anytime(last_chat)
+    if item:
+        await send_recall_prompt(last_chat, item)
     return {"ok": True}
 
 
@@ -95,7 +127,13 @@ async def telegram_webhook(req: Request):
         if not chat_id or not allowed(user_id):
             return {"ok": True}
 
-        if data == "menu_recent":
+        # remember last chat for cron
+        kv_set("global", "last_chat_id", chat_id)
+
+        if data == "menu_home":
+            await tg_send_buttons(chat_id, "Choose an action:", main_menu_buttons())
+
+        elif data == "menu_recent":
             items = get_recent_study(chat_id, n=5)
             if not items:
                 out = "No study items yet. Try: I studied EOQ"
@@ -109,6 +147,20 @@ async def telegram_webhook(req: Request):
             item = get_random_study(chat_id)
             out = 'No study items yet. Try: "I studied EOQ"' if not item else f"🧠 Recollect:\n{item['topic']}\n({item['ts']})"
             await tg_send(chat_id, out)
+
+        elif data == "menu_nudge":
+            item = get_due_item(chat_id) or get_next_item_anytime(chat_id)
+            if not item:
+                await tg_send(chat_id, "No recall items yet. Save something with: I studied ...")
+            else:
+                await send_recall_prompt(chat_id, item)
+
+        elif data.startswith("sr_yes:") or data.startswith("sr_no:"):
+            remembered = data.startswith("sr_yes:")
+            review_id = int(data.split(":")[1])
+            update_review_result(chat_id, review_id, remembered=remembered)
+            await tg_send_buttons(chat_id, "✅ Logged. Want another?", [[{"text": "🔁 Nudge me", "callback_data": "menu_nudge"}],
+                                                                       [{"text": "🏠 Menu", "callback_data": "menu_home"}]])
 
         elif data == "menu_add_resource":
             set_mode(chat_id, "awaiting_resource")
@@ -131,11 +183,9 @@ async def telegram_webhook(req: Request):
         elif data == "menu_news":
             await tg_send(chat_id, "🗞 News agent coming next.")
 
+        # stop spinner
         async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(
-                f"{TELEGRAM_API}/answerCallbackQuery",
-                json={"callback_query_id": cb.get("id")},
-            )
+            await client.post(f"{TELEGRAM_API}/answerCallbackQuery", json={"callback_query_id": cb.get("id")})
         return {"ok": True}
 
     # --- Normal messages ---
@@ -152,6 +202,8 @@ async def telegram_webhook(req: Request):
     if not chat_id or not allowed(user_id):
         return {"ok": True}
 
+    kv_set("global", "last_chat_id", chat_id)
+
     if is_help(text):
         await tg_send_buttons(chat_id, "Choose an action:", main_menu_buttons())
         return {"ok": True}
@@ -163,16 +215,18 @@ async def telegram_webhook(req: Request):
         await tg_send(chat_id, "✅ Cancelled.")
         return {"ok": True}
 
-    # --- Mode-based Handling ---
     mode = get_mode(chat_id)
 
+    # Record study mode
     if mode == "awaiting_study" and text:
         topic = extract_study_topic(text) or text
-        append_study(chat_id, user_id, username, topic, text)
+        study_id = append_study(chat_id, user_id, username, topic, text)
+        enqueue_review(chat_id, study_id, topic)
         set_mode(chat_id, "")
-        await tg_send_buttons(chat_id, f'✅ Saved: "{topic}"', main_menu_buttons())
+        await tg_send_buttons(chat_id, f'✅ Saved: "{topic}"\n🔁 I’ll nudge you later to recall this.', main_menu_buttons())
         return {"ok": True}
 
+    # Resource capture mode
     if mode == "awaiting_resource":
         url = extract_url(text)
         if not url:
@@ -183,6 +237,7 @@ async def telegram_webhook(req: Request):
         await tg_send_buttons(chat_id, f"🔖 Saved to Learning Bag:\n{url}", main_menu_buttons())
         return {"ok": True}
 
+    # Quiz topic selection
     if mode == "awaiting_quiz_topic":
         t = text.strip().lower()
         if t == "quiz recent":
@@ -197,10 +252,10 @@ async def telegram_webhook(req: Request):
         kv_set(chat_id, "quiz_questions", json.dumps(questions))
         kv_set(chat_id, "quiz_answers", json.dumps([]))
         set_mode(chat_id, "awaiting_quiz_answer_0")
-
         await tg_send(chat_id, f"🧠 Quiz on: {topic}\n\n{questions[0]}\n\nReply with your answer (or type cancel).")
         return {"ok": True}
 
+    # Quiz answers
     if mode.startswith("awaiting_quiz_answer_"):
         try:
             idx = int(mode.split("_")[-1])
@@ -211,12 +266,11 @@ async def telegram_webhook(req: Request):
         a_raw = kv_get(chat_id, "quiz_answers")
         if not q_raw:
             set_mode(chat_id, "")
-            await tg_send_buttons(chat_id, "Quiz state was missing. Starting over.", main_menu_buttons())
+            await tg_send_buttons(chat_id, "Quiz state missing. Starting over.", main_menu_buttons())
             return {"ok": True}
 
         questions = json.loads(q_raw)
         answers = json.loads(a_raw) if a_raw else []
-
         answers.append(text)
         kv_set(chat_id, "quiz_answers", json.dumps(answers))
 
@@ -229,18 +283,13 @@ async def telegram_webhook(req: Request):
         set_mode(chat_id, "")
         kv_del(chat_id, "quiz_questions")
         kv_del(chat_id, "quiz_answers")
-
         recap = []
         for i, (q, a) in enumerate(zip(questions, answers), start=1):
             recap.append(f"{i}) Q: {q}\n   A: {a}")
-
-        await tg_send_buttons(
-            chat_id,
-            "✅ Quiz complete! Here’s your recap:\n\n" + "\n\n".join(recap),
-            main_menu_buttons()
-        )
+        await tg_send_buttons(chat_id, "✅ Quiz complete!\n\n" + "\n\n".join(recap), main_menu_buttons())
         return {"ok": True}
 
+    # Text commands
     if is_recent(text):
         items = get_recent_study(chat_id, n=5)
         if not items:
@@ -260,8 +309,9 @@ async def telegram_webhook(req: Request):
 
     topic = extract_study_topic(text)
     if topic:
-        append_study(chat_id, user_id, username, topic, text)
-        await tg_send(chat_id, f'✅ Saved. You studied: "{topic}"')
+        study_id = append_study(chat_id, user_id, username, topic, text)
+        enqueue_review(chat_id, study_id, topic)
+        await tg_send(chat_id, f'✅ Saved. You studied: "{topic}"\n🔁 I’ll nudge you later to recall this.')
         return {"ok": True}
 
     await tg_send(chat_id, 'Got it. Type "help" for commands.')

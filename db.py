@@ -1,7 +1,7 @@
 import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 DB_PATH = os.getenv("DB_PATH", "./data.db")
 
@@ -15,8 +15,14 @@ def get_conn():
     finally:
         conn.close()
 
+def now_utc():
+    return datetime.now(timezone.utc)
+
 def now_iso():
-    return datetime.now(timezone.utc).isoformat()
+    return now_utc().isoformat()
+
+def iso_in_days(days: int):
+    return (now_utc() + timedelta(days=days)).isoformat()
 
 def init_db():
     with get_conn() as conn:
@@ -51,8 +57,6 @@ def init_db():
             updated_at TEXT
         );
         """)
-
-        # ✅ Small KV store for agent workflows (quiz questions/answers, etc.)
         conn.execute("""
         CREATE TABLE IF NOT EXISTS state_kv (
             chat_id TEXT NOT NULL,
@@ -63,11 +67,35 @@ def init_db():
         );
         """)
 
-def append_study(chat_id: str, user_id: str, username: str, topic: str, raw_text: str):
+        # ✅ Spaced repetition queue
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS review_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT NOT NULL,
+            study_id INTEGER NOT NULL,
+            topic TEXT NOT NULL,
+            interval_days INTEGER NOT NULL DEFAULT 1,
+            due_ts TEXT NOT NULL,
+            last_result TEXT DEFAULT "",
+            created_ts TEXT NOT NULL,
+            updated_ts TEXT NOT NULL
+        );
+        """)
+
+def append_study(chat_id: str, user_id: str, username: str, topic: str, raw_text: str) -> int:
     with get_conn() as conn:
-        conn.execute(
+        cur = conn.execute(
             "INSERT INTO study_log (ts, chat_id, user_id, username, topic, raw_text) VALUES (?,?,?,?,?,?)",
             (now_iso(), str(chat_id), str(user_id or ""), str(username or ""), topic, raw_text),
+        )
+        return int(cur.lastrowid)
+
+def enqueue_review(chat_id: str, study_id: int, topic: str):
+    # First review due tomorrow (simple default)
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO review_queue (chat_id, study_id, topic, interval_days, due_ts, created_ts, updated_ts) VALUES (?,?,?,?,?,?,?)",
+            (str(chat_id), int(study_id), topic, 1, iso_in_days(1), now_iso(), now_iso()),
         )
 
 def get_recent_study(chat_id: str, n: int = 5):
@@ -114,7 +142,7 @@ def append_resource_link(chat_id: str, user_id: str, title: str, url: str, raw_t
             (now_iso(), str(chat_id), str(user_id or ""), "link", title, url, "", raw_text),
         )
 
-# -------- KV helpers (for agent state) --------
+# -------- KV helpers --------
 def kv_set(chat_id: str, k: str, v: str):
     with get_conn() as conn:
         conn.execute(
@@ -136,4 +164,44 @@ def kv_del(chat_id: str, k: str):
         conn.execute(
             "DELETE FROM state_kv WHERE chat_id=? AND k=?",
             (str(chat_id), k),
+        )
+
+# -------- Spaced repetition helpers --------
+def get_due_item(chat_id: str):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM review_queue WHERE chat_id=? AND due_ts <= ? ORDER BY due_ts ASC LIMIT 1",
+            (str(chat_id), now_iso()),
+        ).fetchone()
+    return dict(row) if row else None
+
+def get_next_item_anytime(chat_id: str):
+    # if nothing due yet, pick the soonest upcoming (so "nudge" always returns something)
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM review_queue WHERE chat_id=? ORDER BY due_ts ASC LIMIT 1",
+            (str(chat_id),),
+        ).fetchone()
+    return dict(row) if row else None
+
+def update_review_result(chat_id: str, review_id: int, remembered: bool):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT interval_days FROM review_queue WHERE id=? AND chat_id=?",
+            (int(review_id), str(chat_id)),
+        ).fetchone()
+        if not row:
+            return
+
+        interval = int(row["interval_days"] or 1)
+        if remembered:
+            new_interval = min(interval * 2, 30)   # cap at 30 days
+            result = "remembered"
+        else:
+            new_interval = 1
+            result = "forgot"
+
+        conn.execute(
+            "UPDATE review_queue SET interval_days=?, due_ts=?, last_result=?, updated_ts=? WHERE id=? AND chat_id=?",
+            (new_interval, iso_in_days(new_interval), result, now_iso(), int(review_id), str(chat_id)),
         )
