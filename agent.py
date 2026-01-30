@@ -39,3 +39,23 @@ def extract_study_topic(text: str):
 def extract_url(text: str):
     m = re.search(r"(https?://\S+)", text, flags=re.I)
     return m.group(1) if m else None
+
+async def send_recall_prompt(chat_id: str, item: dict, tg_send):
+    """
+    Sends a recall-style prompt for spaced repetition.
+    Expects item to have: topic, ts, and optionally notes.
+    """
+    topic = item.get("topic", "Unknown topic")
+    ts = item.get("ts", "")
+
+    message = (
+        "🧠 **Recall time**\n\n"
+        f"Topic: *{topic}*\n\n"
+        "👉 Try to recall:\n"
+        "- Key ideas\n"
+        "- Definitions\n"
+        "- Examples\n\n"
+        "_Reply when done, or type `next`._"
+    )
+
+    await tg_send(chat_id, message)

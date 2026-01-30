@@ -3,6 +3,9 @@ import httpx
 from fastapi import FastAPI, Request
 from dotenv import load_dotenv
 
+from db import get_due_item, get_next_item_anytime
+from agent import send_recall_prompt
+
 from db import (
     init_db,
     append_study,
@@ -171,11 +174,11 @@ async def telegram_webhook(req: Request):
             await tg_send(chat_id, "❓ What topic should I quiz you on?\n\nType a topic OR send: quiz recent")
 
         elif data == "menu_nudge":
-            # If your nudge/spaced repetition logic is in a different file,
-            # we keep this safe and non-breaking:
-            await tg_send(chat_id, "🔁 Nudge agent is wired, but your due-item logic lives in db/agent.\nTell me your function names and I’ll hook it up cleanly.")
-            # (Since you said nudge is working already, you may already have this implemented elsewhere.
-            # If you want, paste your existing menu_nudge block and I’ll merge it here.)
+            item = get_due_item(chat_id) or get_next_item_anytime(chat_id)
+            if not item:
+                await tg_send(chat_id, 'No recall items yet. Save something with: "I studied ..."')
+            else:
+                await send_recall_prompt(chat_id, item, tg_send)
 
         elif data == "menu_news":
             await tg_send(chat_id, "🗞 News agent coming next.")
