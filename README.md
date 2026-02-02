@@ -86,6 +86,15 @@ LLM (Evaluation only)
 - Render
 
 ---
+## 📸 Product Walkthrough
+
+### Learning Capture
+![Study Capture](screenshots/Study_capture.png)
+
+### Quiz Question
+![Quiz Grading](screenshots/Quiz_question.png)
+
+
 
 ## 📈 Future Extensions
 
