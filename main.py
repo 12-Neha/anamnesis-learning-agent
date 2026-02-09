@@ -172,3 +172,6 @@ async def telegram_webhook(req: Request):
         return {"ok": True}
 
 
+@app.get("/")
+async def health():
+    return {"ok": True}
