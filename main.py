@@ -9,7 +9,7 @@ from db import init_db, append_study, get_recent_study, get_random_study
 
 from agent import (
     norm, is_help, is_recent, is_recollect, is_add_resource, is_cancel,
-    extract_study_topic, extract_url, HELP_TEXT, generate_quiz_questions, send_recall_prompt
+    extract_study_topic, extract_url, HELP_TEXT, send_recall_prompt
 )
 
 load_dotenv()
@@ -132,7 +132,7 @@ async def telegram_webhook(req: Request):
     if not allowed(user_id): return {"ok": True}
 
     mode = get_mode(chat_id)
-    # --- QUIZ TOPIC MODE ---
+    # --- QUIZ TOPIC MODE (MINIMAL PLACEHOLDER) ---
     if mode == "awaiting_quiz_topic" and text:
         if text.strip().lower() == "quiz recent":
             rec = get_recent_study(chat_id, n=1)
@@ -143,20 +143,12 @@ async def telegram_webhook(req: Request):
         else:
             topic = text.strip()
 
-        questions = generate_quiz_questions(topic, n=5)
-        session_id = create_quiz_session(chat_id, user_id, topic, questions)
-        sess = get_active_quiz_session(chat_id)
-        q = get_quiz_question(session_id, sess["current_idx"])
-        msg_txt = format_quiz_q(q, sess["current_idx"], sess["total"], sess["topic"])
+        # Minimal quiz placeholder so deploy succeeds even without quiz DB/functions
         set_mode(chat_id, "")
-        await tg_send_buttons(chat_id, msg_txt, quiz_answer_buttons(session_id))
+        await tg_send(
+            chat_id,
+            f"✅ Quiz mode set for: {topic}\n\n(Next step: generate questions + track answers. For now, reply with 3 key takeaways and 1 example.)"
+        )
+        await tg_send_buttons(chat_id, "Main Menu:", main_menu_buttons())
         return {"ok": True}
 
-    if is_help(text):
-        await tg_send_buttons(chat_id, "Main Menu:", main_menu_buttons())
-    elif get_mode(chat_id) == "awaiting_study" and text:
-        append_study(chat_id, user_id, msg["from"].get("username", ""), text, text)
-        set_mode(chat_id, "")
-        await tg_send_buttons(chat_id, f"✅ Recorded: {text}", main_menu_buttons())
-
-    return {"ok": True}
