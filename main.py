@@ -5,11 +5,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-from db import (
-    init_db, append_study, get_recent_study, get_random_study,
-    set_mode, get_mode, append_resource_link, get_due_item, get_next_item_anytime,
-    create_quiz_session, get_active_quiz_session, get_quiz_question, answer_quiz_question
-)
+from db import init_db, append_study, get_recent_study, get_random_study
+
 from agent import (
     norm, is_help, is_recent, is_recollect, is_add_resource, is_cancel,
     extract_study_topic, extract_url, HELP_TEXT, generate_quiz_questions, send_recall_prompt
