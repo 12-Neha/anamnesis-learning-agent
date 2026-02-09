@@ -67,9 +67,9 @@ def main_menu_buttons():
          {"text": "📌 Recent", "callback_data": "menu_recent"}],
         [{"text": "🧠 Recollect", "callback_data": "menu_recollect"},
          {"text": "🎒 Add resource", "callback_data": "menu_add_resource"}],
-        [{"text": "❓ Quiz me", "callback_data": "menu_quiz"}],
         [{"text": "🔁 Nudge me", "callback_data": "menu_nudge"},
-         {"text": "❌ Cancel", "callback_data": "menu_cancel"}],
+         {"text": "❓ Quiz me", "callback_data": "menu_quiz"}],
+        [{"text": "❌ Cancel", "callback_data": "menu_cancel"}],
     ]
 
 @app.post("/telegram/webhook")
