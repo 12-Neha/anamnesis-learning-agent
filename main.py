@@ -5,12 +5,28 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-from db import init_db, append_study, get_recent_study, get_random_study
+from db import (
+    init_db,
+    append_study,
+    get_recent_study,
+    get_random_study,
+    set_mode,
+    get_mode,
+    append_resource_link
+)
 
 from agent import (
-    norm, is_help, is_recent, is_recollect, is_add_resource, is_cancel,
-    extract_study_topic, extract_url, HELP_TEXT, send_recall_prompt
+    norm,
+    is_help,
+    is_recent,
+    is_recollect,
+    is_add_resource,
+    is_cancel,
+    extract_study_topic,
+    extract_url,
+    HELP_TEXT
 )
+
 
 load_dotenv()
 app = FastAPI()
@@ -132,7 +148,11 @@ async def telegram_webhook(req: Request):
     if not allowed(user_id): return {"ok": True}
 
     mode = get_mode(chat_id)
-    # --- QUIZ TOPIC MODE (MINIMAL PLACEHOLDER) ---
+   
+
+    
+
+    # --- QUIZ TOPIC MODE (SAFE PLACEHOLDER) ---
     if mode == "awaiting_quiz_topic" and text:
         if text.strip().lower() == "quiz recent":
             rec = get_recent_study(chat_id, n=1)
@@ -143,12 +163,12 @@ async def telegram_webhook(req: Request):
         else:
             topic = text.strip()
 
-        # Minimal quiz placeholder so deploy succeeds even without quiz DB/functions
         set_mode(chat_id, "")
         await tg_send(
             chat_id,
-            f"✅ Quiz mode set for: {topic}\n\n(Next step: generate questions + track answers. For now, reply with 3 key takeaways and 1 example.)"
+            f"🧠 Quiz coming soon for: {topic}\n\nFor now, tell me:\n1. Key idea\n2. Example\n3. When you'd use it"
         )
         await tg_send_buttons(chat_id, "Main Menu:", main_menu_buttons())
         return {"ok": True}
+
 
