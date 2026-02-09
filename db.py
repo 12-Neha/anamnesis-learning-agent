@@ -205,3 +205,89 @@ def update_review_result(chat_id: str, review_id: int, remembered: bool):
             "UPDATE review_queue SET interval_days=?, due_ts=?, last_result=?, updated_ts=? WHERE id=? AND chat_id=?",
             (new_interval, iso_in_days(new_interval), result, now_iso(), int(review_id), str(chat_id)),
         )
+
+# ----------------- QUIZ SESSION (B) -----------------
+
+import json
+from datetime import datetime, timezone
+
+def ensure_quiz_tables():
+    con = _conn()
+    cur = con.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS quiz_sessions (
+        chat_id TEXT PRIMARY KEY,
+        topic TEXT,
+        questions_json TEXT,
+        idx INTEGER DEFAULT 0,
+        started_ts TEXT
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS quiz_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id TEXT,
+        topic TEXT,
+        question TEXT,
+        ideal TEXT,
+        answer TEXT,
+        score INTEGER,
+        verdict TEXT,
+        created_ts TEXT
+    )
+    """)
+    con.commit()
+    con.close()
+
+def start_quiz(chat_id: str, topic: str, questions: list[dict]):
+    ensure_quiz_tables()
+    con = _conn()
+    cur = con.cursor()
+    cur.execute("""
+      INSERT INTO quiz_sessions(chat_id, topic, questions_json, idx, started_ts)
+      VALUES(?,?,?,?,?)
+      ON CONFLICT(chat_id) DO UPDATE SET
+        topic=excluded.topic,
+        questions_json=excluded.questions_json,
+        idx=0,
+        started_ts=excluded.started_ts
+    """, (chat_id, topic, json.dumps(questions), 0, datetime.now(timezone.utc).isoformat()))
+    con.commit()
+    con.close()
+
+def get_quiz(chat_id: str):
+    ensure_quiz_tables()
+    con = _conn()
+    cur = con.cursor()
+    cur.execute("SELECT topic, questions_json, idx FROM quiz_sessions WHERE chat_id=?", (chat_id,))
+    row = cur.fetchone()
+    con.close()
+    if not row:
+        return None
+    topic, qj, idx = row
+    return {"topic": topic, "questions": json.loads(qj), "idx": idx}
+
+def advance_quiz(chat_id: str):
+    con = _conn()
+    cur = con.cursor()
+    cur.execute("UPDATE quiz_sessions SET idx = idx + 1 WHERE chat_id=?", (chat_id,))
+    con.commit()
+    con.close()
+
+def end_quiz(chat_id: str):
+    con = _conn()
+    cur = con.cursor()
+    cur.execute("DELETE FROM quiz_sessions WHERE chat_id=?", (chat_id,))
+    con.commit()
+    con.close()
+
+def log_quiz_result(chat_id: str, topic: str, question: str, ideal: str, answer: str, score: int, verdict: str):
+    ensure_quiz_tables()
+    con = _conn()
+    cur = con.cursor()
+    cur.execute("""
+      INSERT INTO quiz_logs(chat_id, topic, question, ideal, answer, score, verdict, created_ts)
+      VALUES(?,?,?,?,?,?,?,?)
+    """, (chat_id, topic, question, ideal, answer, score, verdict, datetime.now(timezone.utc).isoformat()))
+    con.commit()
+    con.close()
