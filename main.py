@@ -6,32 +6,13 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 
 from db import (
-    init_db,
-    append_study,
-    get_recent_study,
-    get_random_study,
-    set_mode,
-    get_mode,
-    append_resource_link,
-    get_due_item,
-    get_next_item_anytime,
-    create_quiz_session,
-    get_active_quiz_session,
-    get_quiz_question,
-    answer_quiz_question
+    init_db, append_study, get_recent_study, get_random_study,
+    set_mode, get_mode, append_resource_link, get_due_item, get_next_item_anytime,
+    create_quiz_session, get_active_quiz_session, get_quiz_question, answer_quiz_question
 )
 from agent import (
-    norm,
-    is_help,
-    is_recent,
-    is_recollect,
-    is_add_resource,
-    is_cancel,
-    extract_study_topic,
-    extract_url,
-    HELP_TEXT,
-    generate_quiz_questions,
-    send_recall_prompt,
+    norm, is_help, is_recent, is_recollect, is_add_resource, is_cancel,
+    extract_study_topic, extract_url, HELP_TEXT, generate_quiz_questions, send_recall_prompt
 )
 
 load_dotenv()
@@ -44,46 +25,52 @@ DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "").strip()
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 VERCEL_ORIGIN = os.getenv("VERCEL_ORIGIN", "*").strip()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[VERCEL_ORIGIN] if VERCEL_ORIGIN != "*" else ["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 def allowed(user_id: str) -> bool:
-    if not ALLOWED_USER_ID:
-        return True
-    return str(user_id) == str(ALLOWED_USER_ID)
+    return not ALLOWED_USER_ID or str(user_id) == str(ALLOWED_USER_ID)
 
 async def tg_send(chat_id: str, text: str):
     if not TELEGRAM_BOT_TOKEN: return
     async with httpx.AsyncClient(timeout=15) as client:
-        await client.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
+        await client.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": text})
 
 async def tg_send_buttons(chat_id: str, text: str, buttons: list[list[dict]]):
     if not TELEGRAM_BOT_TOKEN: return
-    payload = {"chat_id": chat_id, "text": text, "reply_markup": {"inline_keyboard": buttons}, "parse_mode": "Markdown"}
+    payload = {"chat_id": chat_id, "text": text, "reply_markup": {"inline_keyboard": buttons}}
     async with httpx.AsyncClient(timeout=15) as client:
         await client.post(f"{TELEGRAM_API}/sendMessage", json=payload)
+
+# --- QUIZ HELPERS ---
+
+def quiz_answer_buttons(session_id: int):
+    return [[
+      {"text": "A", "callback_data": f"quiz_ans:{session_id}:A"},
+      {"text": "B", "callback_data": f"quiz_ans:{session_id}:B"},
+      {"text": "C", "callback_data": f"quiz_ans:{session_id}:C"},
+      {"text": "D", "callback_data": f"quiz_ans:{session_id}:D"},
+    ]]
+
+def format_quiz_q(q: dict, idx: int, total: int, topic: str):
+    return (
+      f"❓ Quiz on: {topic}\n"
+      f"Q{idx+1}/{total}: {q['question']}\n\n"
+      f"A) {q['A']}\n"
+      f"B) {q['B']}\n"
+      f"C) {q['C']}\n"
+      f"D) {q['D']}"
+    )
 
 def main_menu_buttons():
     return [
         [{"text": "📝 Record study", "callback_data": "menu_record"},
          {"text": "📌 Recent", "callback_data": "menu_recent"}],
-        [{"text": "🧠 Recollect", "bullet": "menu_recollect"},
+        [{"text": "🧠 Recollect", "callback_data": "menu_recollect"},
          {"text": "🎒 Add resource", "callback_data": "menu_add_resource"}],
-        [{"text": "❓ Quiz Me", "callback_data": "menu_quiz_start"}],
+        [{"text": "❓ Quiz me", "callback_data": "menu_quiz"}],
         [{"text": "🔁 Nudge me", "callback_data": "menu_nudge"},
          {"text": "❌ Cancel", "callback_data": "menu_cancel"}],
     ]
-
-@app.get("/")
-async def health():
-    return {"ok": True}
-
-# --- Telegram Webhook Logic ---
 
 @app.post("/telegram/webhook")
 async def telegram_webhook(req: Request):
@@ -93,71 +80,86 @@ async def telegram_webhook(req: Request):
         return {"ok": True}
 
     cb = update.get("callback_query")
-    if cb:
-        chat_id = str(cb["message"]["chat"]["id"])
-        user_id = str(cb["from"]["id"])
-        data = cb.get("data", "")
-        if not allowed(user_id): return {"ok": True}
+    async with httpx.AsyncClient(timeout=10) as client:
+        if cb:
+            chat_id = str(cb["message"]["chat"]["id"])
+            user_id = str(cb["from"]["id"])
+            data = cb.get("data", "")
+            if not allowed(user_id): return {"ok": True}
 
-        # Quiz Start Logic
-        if data == "menu_quiz_start":
-            recent = get_recent_study(chat_id, n=1)
-            if not recent:
-                await tg_send(chat_id, "No study history found. Record something first!")
-            else:
-                topic = recent[0]["topic"]
-                questions = generate_quiz_questions(topic)
-                create_quiz_session(chat_id, user_id, topic, questions)
-                await tg_send(chat_id, f"🚀 Starting quiz on: *{topic}*")
-                q = get_quiz_question(get_active_quiz_session(chat_id)["id"], 0)
-                buttons = [[{"text": opt, "callback_data": f"quiz_ans_{opt}"}] for opt in ["A", "B", "C", "D"]]
-                await tg_send_buttons(chat_id, f"1/5: {q['question']}\n\nA) {q['A']}\nB) {q['B']}\nC) {q['C']}\nD) {q['D']}", buttons)
+            # --- QUIZ ANSWERS (callback) ---
+            if data.startswith("quiz_ans:"):
+                parts = data.split(":")
+                session_id, ans = int(parts[1]), parts[2].strip().upper()
+                sess = get_active_quiz_session(chat_id)
 
-        # Quiz Answer Logic
-        elif data.startswith("quiz_ans_"):
-            ans = data.replace("quiz_ans_", "")
-            session = get_active_quiz_session(chat_id)
-            if session:
-                res = answer_quiz_question(session["id"], session["current_idx"], ans)
-                feedback = "✅ Correct!" if res["is_correct"] else f"❌ Wrong. Correct: {res['correct']}"
-                await tg_send(chat_id, f"{feedback}\n\n_{res['explanation']}_")
-                
-                if res["done"]:
-                    await tg_send_buttons(chat_id, f"🏆 Quiz Finished!\nScore: {res['new_score']}/{res['total']}", main_menu_buttons())
+                if not sess or sess["id"] != session_id:
+                    await tg_send(chat_id, "This quiz session is not active anymore. Type: quiz me")
+                    await client.post(f"{TELEGRAM_API}/answerCallbackQuery", json={"callback_query_id": cb.get("id")})
+                    return {"ok": True}
+
+                result = answer_quiz_question(session_id, sess["current_idx"], ans)
+                if "error" in result:
+                    await tg_send(chat_id, f"⚠️ {result['error']}")
                 else:
-                    next_q = get_quiz_question(session["id"], res["next_idx"])
-                    buttons = [[{"text": opt, "callback_data": f"quiz_ans_{opt}"}] for opt in ["A", "B", "C", "D"]]
-                    await tg_send_buttons(chat_id, f"{res['next_idx']+1}/{res['total']}: {next_q['question']}\n\nA) {next_q['A']}\nB) {next_q['B']}\nC) {next_q['C']}\nD) {next_q['D']}", buttons)
+                    verdict = "✅ Correct!" if result["is_correct"] else f"❌ Not quite. Correct: {result['correct']}"
+                    await tg_send(chat_id, f"{verdict}\n{result['explanation']}\n\nScore: {result['new_score']}/{result['total']}")
 
-        # Standard Menu Handlers
-        elif data == "menu_record":
-            set_mode(chat_id, "awaiting_study")
-            await tg_send(chat_id, "📝 What are you studying?")
-        elif data == "menu_cancel":
-            set_mode(chat_id, "")
-            await tg_send_buttons(chat_id, "✅ Cancelled.", main_menu_buttons())
+                    if result["done"]:
+                        await tg_send_buttons(chat_id, "🎉 Quiz complete! Want to do another?", main_menu_buttons())
+                    else:
+                        updated = get_active_quiz_session(chat_id)
+                        q = get_quiz_question(session_id, updated["current_idx"])
+                        msg_txt = format_quiz_q(q, updated["current_idx"], updated["total"], updated["topic"])
+                        await tg_send_buttons(chat_id, msg_txt, quiz_answer_buttons(session_id))
 
-        async with httpx.AsyncClient() as client:
-            await client.post(f"{TELEGRAM_API}/answerCallbackQuery", json={"callback_query_id": cb["id"]})
-        return {"ok": True}
+                await client.post(f"{TELEGRAM_API}/answerCallbackQuery", json={"callback_query_id": cb.get("id")})
+                return {"ok": True}
 
-    # Handle text messages
+            elif data == "menu_quiz":
+                set_mode(chat_id, "awaiting_quiz_topic")
+                await tg_send(chat_id, "❓ What topic should I quiz you on?\nType a topic OR send: quiz recent")
+            elif data == "menu_record":
+                set_mode(chat_id, "awaiting_study")
+                await tg_send(chat_id, "📝 Send the topic you just studied.")
+            elif data == "menu_cancel":
+                set_mode(chat_id, "")
+                await tg_send(chat_id, "✅ Cancelled.")
+
+            await client.post(f"{TELEGRAM_API}/answerCallbackQuery", json={"callback_query_id": cb.get("id")})
+            return {"ok": True}
+
     msg = update.get("message")
     if not msg: return {"ok": True}
-    chat_id, text = str(msg["chat"]["id"]), norm(msg.get("text", ""))
-    user_id = str(msg["from"]["id"])
+    chat_id, user_id, text = str(msg["chat"]["id"]), str(msg["from"]["id"]), msg.get("text", "")
     if not allowed(user_id): return {"ok": True}
 
-    if is_help(text):
-        await tg_send_buttons(chat_id, "Choose an action:", main_menu_buttons())
-    elif is_cancel(text):
+    mode = get_mode(chat_id)
+    # --- QUIZ TOPIC MODE ---
+    if mode == "awaiting_quiz_topic" and text:
+        if text.strip().lower() == "quiz recent":
+            rec = get_recent_study(chat_id, n=1)
+            if not rec:
+                await tg_send(chat_id, 'No study items yet. Try: "I studied EOQ"')
+                return {"ok": True}
+            topic = rec[0]["topic"]
+        else:
+            topic = text.strip()
+
+        questions = generate_quiz_questions(topic, n=5)
+        session_id = create_quiz_session(chat_id, user_id, topic, questions)
+        sess = get_active_quiz_session(chat_id)
+        q = get_quiz_question(session_id, sess["current_idx"])
+        msg_txt = format_quiz_q(q, sess["current_idx"], sess["total"], sess["topic"])
         set_mode(chat_id, "")
-        await tg_send_buttons(chat_id, "Cancelled.", main_menu_buttons())
+        await tg_send_buttons(chat_id, msg_txt, quiz_answer_buttons(session_id))
+        return {"ok": True}
+
+    if is_help(text):
+        await tg_send_buttons(chat_id, "Main Menu:", main_menu_buttons())
     elif get_mode(chat_id) == "awaiting_study" and text:
-        append_study(chat_id, user_id, msg["from"].get("username", "user"), text, text)
+        append_study(chat_id, user_id, msg["from"].get("username", ""), text, text)
         set_mode(chat_id, "")
         await tg_send_buttons(chat_id, f"✅ Recorded: {text}", main_menu_buttons())
-    else:
-        await tg_send(chat_id, "Use the menu to get started!")
 
     return {"ok": True}
