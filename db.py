@@ -1,293 +1,195 @@
-import os
 import sqlite3
-from contextlib import contextmanager
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
+import json
+import os
 
-DB_PATH = os.getenv("DB_PATH", "./data.db")
+DB_PATH = os.getenv("DB_PATH", "anamnesis.db")
 
-@contextmanager
-def get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+def _conn():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
 
-def now_utc():
-    return datetime.now(timezone.utc)
-
-def now_iso():
-    return now_utc().isoformat()
-
-def iso_in_days(days: int):
-    return (now_utc() + timedelta(days=days)).isoformat()
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat()
 
 def init_db():
-    with get_conn() as conn:
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS study_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts TEXT NOT NULL,
-            chat_id TEXT NOT NULL,
-            user_id TEXT,
-            username TEXT,
-            topic TEXT NOT NULL,
-            raw_text TEXT
-        );
-        """)
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS resources (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts TEXT NOT NULL,
-            chat_id TEXT NOT NULL,
-            user_id TEXT,
-            type TEXT NOT NULL,
-            title TEXT,
-            url TEXT,
-            notes TEXT,
-            raw_text TEXT
-        );
-        """)
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS state (
-            chat_id TEXT PRIMARY KEY,
-            mode TEXT,
-            updated_at TEXT
-        );
-        """)
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS state_kv (
-            chat_id TEXT NOT NULL,
-            k TEXT NOT NULL,
-            v TEXT,
-            updated_at TEXT,
-            PRIMARY KEY (chat_id, k)
-        );
-        """)
+    conn = _conn()
+    cur = conn.cursor()
 
-        # ✅ Spaced repetition queue
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS review_queue (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id TEXT NOT NULL,
-            study_id INTEGER NOT NULL,
-            topic TEXT NOT NULL,
-            interval_days INTEGER NOT NULL DEFAULT 1,
-            due_ts TEXT NOT NULL,
-            last_result TEXT DEFAULT "",
-            created_ts TEXT NOT NULL,
-            updated_ts TEXT NOT NULL
-        );
-        """)
-
-def append_study(chat_id: str, user_id: str, username: str, topic: str, raw_text: str) -> int:
-    with get_conn() as conn:
-        cur = conn.execute(
-            "INSERT INTO study_log (ts, chat_id, user_id, username, topic, raw_text) VALUES (?,?,?,?,?,?)",
-            (now_iso(), str(chat_id), str(user_id or ""), str(username or ""), topic, raw_text),
-        )
-        return int(cur.lastrowid)
-
-def enqueue_review(chat_id: str, study_id: int, topic: str):
-    # First review due tomorrow (simple default)
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO review_queue (chat_id, study_id, topic, interval_days, due_ts, created_ts, updated_ts) VALUES (?,?,?,?,?,?,?)",
-            (str(chat_id), int(study_id), topic, 1, iso_in_days(1), now_iso(), now_iso()),
-        )
-
-def get_recent_study(chat_id: str, n: int = 5):
-    with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT ts, topic FROM study_log WHERE chat_id=? ORDER BY id DESC LIMIT ?",
-            (str(chat_id), n),
-        ).fetchall()
-    return [dict(r) for r in rows]
-
-def get_most_recent_topic(chat_id: str):
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT topic FROM study_log WHERE chat_id=? ORDER BY id DESC LIMIT 1",
-            (str(chat_id),),
-        ).fetchone()
-    return (row["topic"] if row else None)
-
-def get_random_study(chat_id: str):
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT ts, topic FROM study_log WHERE chat_id=? ORDER BY RANDOM() LIMIT 1",
-            (str(chat_id),),
-        ).fetchone()
-    return dict(row) if row else None
-
-def set_mode(chat_id: str, mode: str):
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO state (chat_id, mode, updated_at) VALUES (?,?,?) "
-            "ON CONFLICT(chat_id) DO UPDATE SET mode=excluded.mode, updated_at=excluded.updated_at",
-            (str(chat_id), mode, now_iso()),
-        )
-
-def get_mode(chat_id: str) -> str:
-    with get_conn() as conn:
-        row = conn.execute("SELECT mode FROM state WHERE chat_id=?", (str(chat_id),)).fetchone()
-    return (row["mode"] if row else "") or ""
-
-def append_resource_link(chat_id: str, user_id: str, title: str, url: str, raw_text: str):
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO resources (ts, chat_id, user_id, type, title, url, notes, raw_text) VALUES (?,?,?,?,?,?,?,?)",
-            (now_iso(), str(chat_id), str(user_id or ""), "link", title, url, "", raw_text),
-        )
-
-# -------- KV helpers --------
-def kv_set(chat_id: str, k: str, v: str):
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO state_kv (chat_id, k, v, updated_at) VALUES (?,?,?,?) "
-            "ON CONFLICT(chat_id, k) DO UPDATE SET v=excluded.v, updated_at=excluded.updated_at",
-            (str(chat_id), k, v, now_iso()),
-        )
-
-def kv_get(chat_id: str, k: str):
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT v FROM state_kv WHERE chat_id=? AND k=?",
-            (str(chat_id), k),
-        ).fetchone()
-    return row["v"] if row else None
-
-def kv_del(chat_id: str, k: str):
-    with get_conn() as conn:
-        conn.execute(
-            "DELETE FROM state_kv WHERE chat_id=? AND k=?",
-            (str(chat_id), k),
-        )
-
-# -------- Spaced repetition helpers --------
-def get_due_item(chat_id: str):
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT * FROM review_queue WHERE chat_id=? AND due_ts <= ? ORDER BY due_ts ASC LIMIT 1",
-            (str(chat_id), now_iso()),
-        ).fetchone()
-    return dict(row) if row else None
-
-def get_next_item_anytime(chat_id: str):
-    # if nothing due yet, pick the soonest upcoming (so "nudge" always returns something)
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT * FROM review_queue WHERE chat_id=? ORDER BY due_ts ASC LIMIT 1",
-            (str(chat_id),),
-        ).fetchone()
-    return dict(row) if row else None
-
-def update_review_result(chat_id: str, review_id: int, remembered: bool):
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT interval_days FROM review_queue WHERE id=? AND chat_id=?",
-            (int(review_id), str(chat_id)),
-        ).fetchone()
-        if not row:
-            return
-
-        interval = int(row["interval_days"] or 1)
-        if remembered:
-            new_interval = min(interval * 2, 30)   # cap at 30 days
-            result = "remembered"
-        else:
-            new_interval = 1
-            result = "forgot"
-
-        conn.execute(
-            "UPDATE review_queue SET interval_days=?, due_ts=?, last_result=?, updated_ts=? WHERE id=? AND chat_id=?",
-            (new_interval, iso_in_days(new_interval), result, now_iso(), int(review_id), str(chat_id)),
-        )
-
-# ----------------- QUIZ SESSION (B) -----------------
-
-import json
-from datetime import datetime, timezone
-
-def ensure_quiz_tables():
-    con = _conn()
-    cur = con.cursor()
+    # Core Study Tables
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS quiz_sessions (
-        chat_id TEXT PRIMARY KEY,
-        topic TEXT,
-        questions_json TEXT,
-        idx INTEGER DEFAULT 0,
-        started_ts TEXT
-    )
-    """)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS quiz_logs (
+    CREATE TABLE IF NOT EXISTS study_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         chat_id TEXT,
+        user_id TEXT,
+        username TEXT,
         topic TEXT,
-        question TEXT,
-        ideal TEXT,
-        answer TEXT,
-        score INTEGER,
-        verdict TEXT,
-        created_ts TEXT
-    )
-    """)
-    con.commit()
-    con.close()
+        raw_text TEXT,
+        ts TEXT
+    )""")
 
-def start_quiz(chat_id: str, topic: str, questions: list[dict]):
-    ensure_quiz_tables()
-    con = _conn()
-    cur = con.cursor()
     cur.execute("""
-      INSERT INTO quiz_sessions(chat_id, topic, questions_json, idx, started_ts)
-      VALUES(?,?,?,?,?)
-      ON CONFLICT(chat_id) DO UPDATE SET
-        topic=excluded.topic,
-        questions_json=excluded.questions_json,
-        idx=0,
-        started_ts=excluded.started_ts
-    """, (chat_id, topic, json.dumps(questions), 0, datetime.now(timezone.utc).isoformat()))
-    con.commit()
-    con.close()
+    CREATE TABLE IF NOT EXISTS resource_links (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id TEXT,
+        user_id TEXT,
+        title TEXT,
+        url TEXT,
+        raw_text TEXT,
+        ts TEXT
+    )""")
 
-def get_quiz(chat_id: str):
-    ensure_quiz_tables()
-    con = _conn()
-    cur = con.cursor()
-    cur.execute("SELECT topic, questions_json, idx FROM quiz_sessions WHERE chat_id=?", (chat_id,))
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS user_modes (
+        chat_id TEXT PRIMARY KEY,
+        mode TEXT
+    )""")
+
+    # Quiz Tables
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS quiz_sessions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      chat_id TEXT NOT NULL,
+      user_id TEXT,
+      topic TEXT NOT NULL,
+      created_ts TEXT NOT NULL,
+      status TEXT NOT NULL,
+      current_idx INTEGER NOT NULL DEFAULT 0,
+      score INTEGER NOT NULL DEFAULT 0,
+      total INTEGER NOT NULL DEFAULT 0
+    )""")
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS quiz_questions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id INTEGER NOT NULL,
+      q_idx INTEGER NOT NULL,
+      question TEXT NOT NULL,
+      a TEXT NOT NULL,
+      b TEXT NOT NULL,
+      c TEXT NOT NULL,
+      d TEXT NOT NULL,
+      correct TEXT NOT NULL,
+      explanation TEXT NOT NULL,
+      user_answer TEXT,
+      FOREIGN KEY(session_id) REFERENCES quiz_sessions(id)
+    )""")
+
+    conn.commit()
+    conn.close()
+
+# --- Mode Management ---
+def set_mode(chat_id, mode):
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("INSERT OR REPLACE INTO user_modes (chat_id, mode) VALUES (?, ?)", (str(chat_id), mode))
+    conn.commit()
+    conn.close()
+
+def get_mode(chat_id):
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT mode FROM user_modes WHERE chat_id=?", (str(chat_id),))
     row = cur.fetchone()
-    con.close()
-    if not row:
-        return None
-    topic, qj, idx = row
-    return {"topic": topic, "questions": json.loads(qj), "idx": idx}
+    conn.close()
+    return row[0] if row else ""
 
-def advance_quiz(chat_id: str):
-    con = _conn()
-    cur = con.cursor()
-    cur.execute("UPDATE quiz_sessions SET idx = idx + 1 WHERE chat_id=?", (chat_id,))
-    con.commit()
-    con.close()
+# --- Study & Resource Functions ---
+def append_study(chat_id, user_id, username, topic, raw_text):
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO study_logs (chat_id, user_id, username, topic, raw_text, ts) VALUES (?,?,?,?,?,?)",
+                (str(chat_id), str(user_id), username, topic, raw_text, _now_iso()))
+    conn.commit()
+    conn.close()
 
-def end_quiz(chat_id: str):
-    con = _conn()
-    cur = con.cursor()
-    cur.execute("DELETE FROM quiz_sessions WHERE chat_id=?", (chat_id,))
-    con.commit()
-    con.close()
+def get_recent_study(chat_id, n=5):
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT topic, ts FROM study_logs WHERE chat_id=? ORDER BY id DESC LIMIT ?", (str(chat_id), n))
+    rows = cur.fetchall()
+    conn.close()
+    return [{"topic": r[0], "ts": r[1]} for r in rows]
 
-def log_quiz_result(chat_id: str, topic: str, question: str, ideal: str, answer: str, score: int, verdict: str):
-    ensure_quiz_tables()
-    con = _conn()
-    cur = con.cursor()
+def get_random_study(chat_id):
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT topic, ts FROM study_logs WHERE chat_id=? ORDER BY RANDOM() LIMIT 1", (str(chat_id),))
+    row = cur.fetchone()
+    conn.close()
+    return {"topic": row[0], "ts": row[1]} if row else None
+
+def append_resource_link(chat_id, user_id, title, url, raw_text):
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO resource_links (chat_id, user_id, title, url, raw_text, ts) VALUES (?,?,?,?,?,?)",
+                (str(chat_id), str(user_id), title, url, raw_text, _now_iso()))
+    conn.commit()
+    conn.close()
+
+# --- Quiz Session Logic ---
+def create_quiz_session(chat_id: str, user_id: str, topic: str, questions: list[dict]) -> int:
+    conn = _conn()
+    cur = conn.cursor()
     cur.execute("""
-      INSERT INTO quiz_logs(chat_id, topic, question, ideal, answer, score, verdict, created_ts)
-      VALUES(?,?,?,?,?,?,?,?)
-    """, (chat_id, topic, question, ideal, answer, score, verdict, datetime.now(timezone.utc).isoformat()))
-    con.commit()
-    con.close()
+      INSERT INTO quiz_sessions (chat_id, user_id, topic, created_ts, status, current_idx, score, total)
+      VALUES (?, ?, ?, ?, 'active', 0, 0, ?)
+    """, (str(chat_id), str(user_id), topic, _now_iso(), len(questions)))
+    session_id = cur.lastrowid
+    for i, q in enumerate(questions):
+        cur.execute("""
+          INSERT INTO quiz_questions (session_id, q_idx, question, a, b, c, d, correct, explanation)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (session_id, i, q["question"], q["A"], q["B"], q["C"], q["D"], q["correct"], q.get("explanation", "")))
+    conn.commit()
+    conn.close()
+    return session_id
+
+def get_active_quiz_session(chat_id: str):
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id, topic, current_idx, score, total FROM quiz_sessions WHERE chat_id=? AND status='active' ORDER BY id DESC LIMIT 1", (str(chat_id),))
+    row = cur.fetchone()
+    conn.close()
+    return {"id": row[0], "topic": row[1], "current_idx": row[2], "score": row[3], "total": row[4]} if row else None
+
+def get_quiz_question(session_id: int, q_idx: int):
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT question, a, b, c, d, correct, explanation, user_answer FROM quiz_questions WHERE session_id=? AND q_idx=? LIMIT 1", (session_id, q_idx))
+    row = cur.fetchone()
+    conn.close()
+    return {"question": row[0], "A": row[1], "B": row[2], "C": row[3], "D": row[4], "correct": row[5], "explanation": row[6], "user_answer": row[7]} if row else None
+
+def answer_quiz_question(session_id: int, q_idx: int, answer: str) -> dict:
+    answer = (answer or "").strip().upper()
+    if answer not in ["A", "B", "C", "D"]: return {"error": "Invalid answer."}
+    q = get_quiz_question(session_id, q_idx)
+    if not q: return {"error": "Question not found."}
+    if q["user_answer"]: return {"error": "Already answered."}
+    
+    conn = _conn()
+    cur = conn.cursor()
+    is_correct = (answer == q["correct"])
+    cur.execute("UPDATE quiz_questions SET user_answer=? WHERE session_id=? AND q_idx=?", (answer, session_id, q_idx))
+    cur.execute("SELECT score, total, current_idx FROM quiz_sessions WHERE id=?", (session_id,))
+    score, total, current_idx = cur.fetchone()
+    
+    if is_correct: score += 1
+    next_idx = current_idx + 1
+    done = (next_idx >= total)
+    
+    status = 'done' if done else 'active'
+    cur.execute("UPDATE quiz_sessions SET score=?, current_idx=?, status=? WHERE id=?", (score, next_idx, status, session_id))
+    
+    conn.commit()
+    conn.close()
+    return {"is_correct": is_correct, "correct": q["correct"], "explanation": q["explanation"], "new_score": score, "done": done, "next_idx": next_idx, "total": total}
+
+def create_quiz_session(chat_id: str, topic: str):
+    # placeholder for future quiz-session persistence
+    return {"chat_id": chat_id, "topic": topic}
+
+
+# Placeholder for nudge logic
+def get_due_item(chat_id): return None
+def get_next_item_anytime(chat_id): return get_random_study(chat_id)
